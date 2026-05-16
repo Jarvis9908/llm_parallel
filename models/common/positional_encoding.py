@@ -117,17 +117,18 @@ class RotaryPositionalEncoding(torch.nn.Module):
         cos = self.cos_cached[start_pos:start_pos + seq_len]  # (seq_len, dim//2)
         sin = self.sin_cached[start_pos:start_pos + seq_len]  # (seq_len, dim//2)
 
-        # 用 repeat_interleave 将每对 cos/sin 复制一次，从 (dim//2,) 扩展到 (dim,)
-        # 例如 [cos0, cos1, cos2] → [cos0, cos0, cos1, cos1, cos2, cos2]
-        cos = cos.repeat_interleave(2, dim=-1)  # (seq_len, dim)
-        sin = sin.repeat_interleave(2, dim=-1)  # (seq_len, dim)
+        # 复制 cos/sin 以匹配 rotated-half 对的维度
+        # rotate_half 的配对是 (i, i+dim/2)，所以每个频率需要出现在 i 和 i+dim/2 两个位置
+        # torch.cat([cos, cos]) → [c0, c1, ..., c0, c1, ...] 而非 repeat_interleave 的 [c0, c0, c1, c1, ...]
+        cos_full = torch.cat([cos, cos], dim=-1)  # (seq_len, dim)
+        sin_full = torch.cat([sin, sin], dim=-1)  # (seq_len, dim)
 
         # 广播维度: (1, 1, seq_len, dim)
-        cos = cos.unsqueeze(0).unsqueeze(0)
-        sin = sin.unsqueeze(0).unsqueeze(0)
+        cos_full = cos_full.unsqueeze(0).unsqueeze(0)
+        sin_full = sin_full.unsqueeze(0).unsqueeze(0)
 
-        q_rot = q * cos + self._rotate_half(q) * sin
-        k_rot = k * cos + self._rotate_half(k) * sin
+        q_rot = q * cos_full + self._rotate_half(q) * sin_full
+        k_rot = k * cos_full + self._rotate_half(k) * sin_full
 
         return q_rot, k_rot
 
