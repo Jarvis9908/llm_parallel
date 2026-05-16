@@ -567,14 +567,14 @@ class RotaryPositionalEncoding(torch.nn.Module):
         sin = self.sin_table[:seq_len]
 
         # 广播 cos/sin 到 (1, 1, seq_len, dim/2) → 复制填充到 head_dim
-        # 每个频率适用于一对维度，所以用 repeat_interleave
+        # 每个频率适用于一对维度，用 cat([cos,cos]) 确保 pair (i, i+dim/2) 共享频率
         cos = cos.unsqueeze(0).unsqueeze(0)  # (1, 1, seq_len, dim/2)
         sin = sin.unsqueeze(0).unsqueeze(0)
 
         # RoPE: q * cos + rotate_half(q) * sin
         # 重复 cos/sin 使得 shape 匹配
-        cos_full = torch.repeat_interleave(cos, 2, dim=-1)  # (1, 1, seq, dim)
-        sin_full = torch.repeat_interleave(sin, 2, dim=-1)
+        cos_full = torch.cat([cos, cos], dim=-1)  # (1, 1, seq, dim)
+        sin_full = torch.cat([sin, sin], dim=-1)
 
         q_rot = q * cos_full + self._rotate_half(q) * sin_full
         k_rot = k * cos_full + self._rotate_half(k) * sin_full
