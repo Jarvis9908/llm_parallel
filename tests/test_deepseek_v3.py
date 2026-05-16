@@ -108,3 +108,68 @@ class TestMoELayer:
         out = moe(x)
         out.sum().backward()
         assert x.grad is not None
+
+
+from models.deepseek_v3.model import DeepSeekV3Block, DeepSeekV3Model, DeepSeekV3ForCausalLM
+
+
+class TestDeepSeekV3Block:
+    """DeepSeek V3 Transformer Block 测试套件。"""
+
+    def test_shape(self):
+        """输出形状应与输入形状一致。"""
+        config = DeepSeekV3Config(
+            dim=128, n_heads=4, kv_lora_rank=64, qk_rope_head_dim=16,
+            n_routed_experts=4, n_shared_experts=1, n_activated_experts=2,
+            moe_intermediate_dim=256
+        )
+        block = DeepSeekV3Block(config)
+        x = torch.randn(2, 8, 128)
+        out = block(x)
+        assert out.shape == x.shape
+
+
+class TestDeepSeekV3Model:
+    """DeepSeek V3 基础模型测试套件。"""
+
+    def test_shape(self):
+        """输出形状应为 (B, S, dim)。"""
+        config = DeepSeekV3Config(
+            dim=128, n_heads=4, n_layers=2, kv_lora_rank=64, qk_rope_head_dim=16,
+            n_routed_experts=4, n_shared_experts=1, n_activated_experts=2,
+            moe_intermediate_dim=256
+        )
+        model = DeepSeekV3Model(config)
+        tokens = torch.randint(0, config.vocab_size, (2, 16))
+        out = model(tokens)
+        assert out.shape == (2, 16, config.dim)
+
+
+class TestDeepSeekV3ForCausalLM:
+    """DeepSeek V3 因果语言模型测试套件。"""
+
+    def test_shape(self):
+        """logits 输出形状应为 (B, S, vocab_size)。"""
+        config = DeepSeekV3Config(
+            dim=128, n_heads=4, n_layers=2, kv_lora_rank=64, qk_rope_head_dim=16,
+            n_routed_experts=4, n_shared_experts=1, n_activated_experts=2,
+            moe_intermediate_dim=256, vocab_size=1000
+        )
+        model = DeepSeekV3ForCausalLM(config)
+        tokens = torch.randint(0, 1000, (2, 8))
+        logits = model(tokens)
+        assert logits.shape == (2, 8, 1000)
+
+    def test_generate(self):
+        """自回归生成应产生正确长度的序列。"""
+        config = DeepSeekV3Config(
+            dim=128, n_heads=4, n_layers=2, kv_lora_rank=64, qk_rope_head_dim=16,
+            n_routed_experts=4, n_shared_experts=1, n_activated_experts=2,
+            moe_intermediate_dim=256, vocab_size=100, max_seq_len=64
+        )
+        model = DeepSeekV3ForCausalLM(config)
+        model.eval()
+        prompt = torch.randint(0, 100, (1, 4))
+        with torch.no_grad():
+            generated = model.generate(prompt, max_new_tokens=6, temperature=1.0)
+        assert generated.shape[1] == 10
