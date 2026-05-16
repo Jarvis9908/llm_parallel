@@ -11,6 +11,7 @@ import sys
 sys.path.insert(0, '.')
 from models.transformer.config import TransformerConfig
 from models.transformer.encoder import EncoderLayer, Encoder
+from models.transformer.decoder import DecoderLayer, Decoder
 
 
 class TestEncoderLayer:
@@ -70,3 +71,61 @@ class TestEncoder:
         out = encoder(token_ids)
         assert out.shape == (2, 16, config.dim), \
             f"Expected (2, 16, {config.dim}), got {out.shape}"
+
+
+class TestDecoderLayer:
+    """DecoderLayer 单元测试"""
+
+    def test_shape(self):
+        """验证输出形状与输入一致"""
+        config = TransformerConfig(dim=64, n_heads=8, ff_hidden_dim=256)
+        layer = DecoderLayer(config)
+        x = torch.randn(2, 16, 64)
+        encoder_out = torch.randn(2, 20, 64)
+        out = layer(x, encoder_out)
+        assert out.shape == x.shape
+
+    def test_causal_self_attn(self):
+        """Decoder 的 self-attention 必须使用 causal mask"""
+        config = TransformerConfig(dim=64, n_heads=8, ff_hidden_dim=256)
+        layer = DecoderLayer(config)
+        layer.eval()  # 关闭 dropout 避免随机性
+        x = torch.randn(1, 4, 64)
+        encoder_out = torch.randn(1, 8, 64)
+        out = layer(x, encoder_out)
+        x2 = x.clone()
+        x2[0, 3] = 999.0
+        out2 = layer(x2, encoder_out)
+        assert torch.allclose(out[0, 1], out2[0, 1], atol=1e-4)
+
+    def test_backward(self):
+        """验证梯度可以反向传播通过 DecoderLayer"""
+        config = TransformerConfig(dim=64, n_heads=8, ff_hidden_dim=256)
+        layer = DecoderLayer(config)
+        x = torch.randn(2, 16, 64, requires_grad=True)
+        encoder_out = torch.randn(2, 20, 64)
+        out = layer(x, encoder_out)
+        out.sum().backward()
+        assert x.grad is not None
+
+
+class TestDecoder:
+    """Decoder 完整测试"""
+
+    def test_shape(self):
+        """验证输出形状正确"""
+        config = TransformerConfig(dim=64, n_heads=8, n_layers=4, ff_hidden_dim=256)
+        decoder = Decoder(config)
+        tgt = torch.randint(0, config.vocab_size, (2, 16))
+        encoder_out = torch.randn(2, 32, 64)
+        out = decoder(tgt, encoder_out)
+        assert out.shape == (2, 16, 64)
+
+    def test_backward(self):
+        """验证梯度可以反向传播通过整个 Decoder"""
+        config = TransformerConfig(dim=64, n_heads=8, n_layers=2, ff_hidden_dim=256)
+        decoder = Decoder(config)
+        tgt = torch.randint(0, config.vocab_size, (2, 16))
+        encoder_out = torch.randn(2, 32, 64)
+        out = decoder(tgt, encoder_out)
+        out.sum().backward()
