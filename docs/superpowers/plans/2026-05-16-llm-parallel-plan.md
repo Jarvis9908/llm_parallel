@@ -40,6 +40,7 @@ tests/                   ← 与对应模块同步构建
 
 **Files:**
 - Create: `requirements.txt`
+- Create: `requirements-cuda.txt`
 - Create: `README.md`
 - Create: `models/__init__.py`
 - Create: `models/common/__init__.py`
@@ -47,7 +48,7 @@ tests/                   ← 与对应模块同步构建
 - Create: `tests/__init__.py`
 - Modify: `.gitignore` (已部分存在)
 
-- [ ] **Step 1: 创建 requirements.txt**
+- [ ] **Step 1: 创建 requirements.txt（CPU 版本）**
 
 ```bash
 cat > requirements.txt << 'EOF'
@@ -57,6 +58,38 @@ matplotlib>=3.7.0
 jupyter>=1.0.0
 pytest>=7.0.0
 EOF
+```
+
+- [ ] **Step 1b: 创建 requirements-cuda.txt（CUDA 版本）**
+
+```bash
+cat > requirements-cuda.txt << 'EOF'
+numpy>=1.24.0
+matplotlib>=3.7.0
+jupyter>=1.0.0
+pytest>=7.0.0
+# torch 需根据本机 CUDA 版本单独安装，见下方安装说明
+EOF
+```
+
+CUDA 版本安装说明（写入 README）：
+
+```bash
+# 1. 先查看本机 CUDA 版本
+nvidia-smi
+
+# 2. 根据 CUDA 版本选择对应的 PyTorch 安装命令
+# CUDA 12.6: pip install torch --index-url https://download.pytorch.org/whl/cu126
+# CUDA 12.4: pip install torch --index-url https://download.pytorch.org/whl/cu124
+# CUDA 12.1: pip install torch --index-url https://download.pytorch.org/whl/cu121
+# CUDA 11.8: pip install torch --index-url https://download.pytorch.org/whl/cu118
+# 最新命令请参考: https://pytorch.org/get-started/locally/
+
+# 3. 安装其余依赖
+pip install -r requirements-cuda.txt
+
+# 4. 验证 CUDA 可用
+python -c "import torch; print(torch.cuda.is_available())"
 ```
 
 - [ ] **Step 2: 创建 README.md**
