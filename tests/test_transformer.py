@@ -12,6 +12,7 @@ sys.path.insert(0, '.')
 from models.transformer.config import TransformerConfig
 from models.transformer.encoder import EncoderLayer, Encoder
 from models.transformer.decoder import DecoderLayer, Decoder
+from models.transformer.model import Transformer
 
 
 class TestEncoderLayer:
@@ -129,3 +130,23 @@ class TestDecoder:
         encoder_out = torch.randn(2, 32, 64)
         out = decoder(tgt, encoder_out)
         out.sum().backward()
+
+
+class TestTransformer:
+    def test_shape(self):
+        config = TransformerConfig(dim=64, n_heads=8, n_layers=2, ff_hidden_dim=256)
+        model = Transformer(config)
+        src = torch.randint(0, config.vocab_size, (2, 20))
+        tgt = torch.randint(0, config.vocab_size, (2, 16))
+        out = model(src, tgt)
+        assert out.shape == (2, 16, config.vocab_size)
+
+    def test_backward(self):
+        config = TransformerConfig(dim=64, n_heads=8, n_layers=2, ff_hidden_dim=256)
+        model = Transformer(config)
+        src = torch.randint(0, config.vocab_size, (2, 20))
+        tgt = torch.randint(0, config.vocab_size, (2, 16))
+        out = model(src, tgt)
+        loss = out.sum()
+        loss.backward()
+        assert model.encoder.layers[0].self_attn.w_q.weight.grad is not None
