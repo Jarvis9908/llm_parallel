@@ -1,0 +1,5 @@
+numpy>=1.24.0
+matplotlib>=3.7.0
+jupyter>=1.0.0
+pytest>=7.0.0
+# torch 需根据本机 CUDA 版本单独安装，见 README 安装说明

@@ -2,4 +2,12 @@
 __pycache__/
 .ipynb_checkpoints/
 *.pyc
+*.pyo
 .venv/
+.idea/
+.claude/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.DS_Store
