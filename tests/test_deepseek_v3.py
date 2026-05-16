@@ -58,3 +58,53 @@ class TestMLA:
         out = mla(x)
         out.sum().backward()
         assert x.grad is not None
+
+
+from models.deepseek_v3.moe import Router, SharedExpert, RoutedExpert, MoELayer
+
+
+class TestRouter:
+    """Router 测试套件。"""
+
+    def test_shape(self):
+        """Router 输出 scores 和 indices 的形状应为 (B, S, top_k)。"""
+        router = Router(dim=128, n_experts=8, top_k=2)
+        x = torch.randn(2, 16, 128)
+        scores, indices = router(x)
+        assert scores.shape == (2, 16, 2)
+        assert indices.shape == (2, 16, 2)
+
+    def test_top_k_indices(self):
+        """Router 输出的专家索引应在有效范围内。"""
+        router = Router(dim=128, n_experts=8, top_k=2)
+        x = torch.randn(2, 16, 128)
+        _, indices = router(x)
+        assert indices.min() >= 0
+        assert indices.max() < 8
+
+
+class TestMoELayer:
+    """MoE Layer 测试套件。"""
+
+    def test_shape(self):
+        """MoE 层输出形状应与输入形状一致。"""
+        config = DeepSeekV3Config(
+            dim=128, n_routed_experts=4, n_shared_experts=1,
+            n_activated_experts=2, moe_intermediate_dim=256
+        )
+        moe = MoELayer(config)
+        x = torch.randn(2, 8, 128)
+        out = moe(x)
+        assert out.shape == x.shape
+
+    def test_backward(self):
+        """梯度应通过 MoE 层正确反向传播。"""
+        config = DeepSeekV3Config(
+            dim=128, n_routed_experts=4, n_shared_experts=1,
+            n_activated_experts=2, moe_intermediate_dim=256
+        )
+        moe = MoELayer(config)
+        x = torch.randn(2, 8, 128, requires_grad=True)
+        out = moe(x)
+        out.sum().backward()
+        assert x.grad is not None
