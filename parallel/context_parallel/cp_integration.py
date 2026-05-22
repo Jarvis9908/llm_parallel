@@ -1,4 +1,31 @@
-"""CP 与其他并行策略的混合方案。"""
+"""CP 与其他并行策略的混合方案。
+
+直觉
+----
+TP（张量并行）切权重，CP（上下文并行）切序列——两者互补。
+TP 解决单层太大放不下一张卡的问题，CP 解决序列太长显存不够的问题。
+两者可以正交组合：TP 在 head 维度切分注意力，CP 在序列维度切分，
+每张卡只需处理 B × (S/P_cp) × D/P_tp 的激活。
+
+数学
+----
+1. CP+TP 显存分析：
+   单卡激活大小 ∝ B × S × D / (P_tp × P_cp)
+   - P_tp: TP 并行度（切 head 维度）
+   - P_cp: CP 并行度（切序列维度）
+   两者乘积越大，每卡激活越小。
+
+2. 并行策略选择启发式规则：
+   - 小模型（<1GB）：DP 即可，无需切分
+   - 中模型（1-10GB）：TP + DP，TP 切权重降低单卡显存
+   - 大模型（>10GB）：TP + PP + DP，PP 进一步切层
+   - 长序列（>8K）：在上述基础上额外加 CP，切序列降低激活显存
+
+代码流程
+--------
+1. ``analyze_cp_tp_memory`` —— 分析 CP+TP 混合并行的显存节省
+2. ``recommend_parallel_config`` —— 根据模型规模推荐并行策略
+"""
 import torch
 
 
@@ -8,9 +35,24 @@ def analyze_cp_tp_memory(
     """
     分析 CP+TP 混合下的显存占用。
 
-    TP 切分：每卡显存 ≈ total_memory / tp_size
-    CP 切分：每卡序列长度 ≈ seq_len / cp_size
-    CP+TP：每卡显存 ≈ total_memory / (tp_size * cp_size)
+    直觉：TP 把权重按 head 切，CP 把序列按长度切，两者正交组合，
+    每张卡的激活只需要原来的 1/(P_tp × P_cp)。
+
+    数学：
+        total_activation = S × D（简化模型，忽略 batch 和 head）
+        per_device_activation = total_activation / (P_tp × P_cp)
+        reduction_ratio = 1 / (P_tp × P_cp)
+
+    Args:
+        seq_len: 序列长度 S
+        dim: 隐层维度 D
+        n_heads: 注意力头数（当前简化模型未使用）
+        tp_size: TP 并行度 P_tp
+        cp_size: CP 并行度 P_cp
+
+    Returns:
+        dict: 包含 total_activation_memory、per_device_activation、
+              reduction_ratio 三项指标
     """
     total_activation = seq_len * dim  # 简化
     per_device_activation = total_activation / (tp_size * cp_size)
@@ -26,11 +68,23 @@ def recommend_parallel_config(
 ) -> str:
     """
     根据模型大小和 GPU 数量推荐并行配置。
-    启发式规则：
-    - 模型 < 1GB: DP only
-    - 模型 1-10GB: TP + DP
-    - 模型 > 10GB: TP + PP + DP
-    - 长序列 (>8K): 额外加 CP
+
+    直觉：小模型用 DP 就够，大模型需要 TP 切权重，超大模型还要 PP 切层，
+    长序列则额外需要 CP 切序列——按需叠加，避免过度切分导致通信开销过大。
+
+    数学（启发式规则）：
+        model_size < 1GB  → DP only
+        1GB ≤ model_size < 10GB → TP + DP
+        model_size ≥ 10GB → TP + PP + DP
+        seq_len > 8192 → 在上述基础上 + CP
+
+    Args:
+        model_size_gb: 模型参数量对应的显存大小（GB）
+        seq_len: 输入序列长度
+        n_gpus: 可用 GPU 数量
+
+    Returns:
+        str: 推荐的并行策略描述
     """
     if model_size_gb < 1:
         return "DP only"

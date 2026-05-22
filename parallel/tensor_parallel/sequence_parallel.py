@@ -1,7 +1,30 @@
-"""序列并行 (Sequence Parallel, SP)。在 TP 区域内沿序列维度切分 LayerNorm/Dropout 的激活值，减少激活显存。
+"""序列并行 (Sequence Parallel, SP) —— 在 TP 区域外沿序列维度切分激活值，减少 LayerNorm/Dropout 的显存占用。
 
-与 Megatron-LM SP 一致：在 column parallel 区域外（LayerNorm/Dropout）沿 sequence 维度切分，
-跨 rank 做 all-gather 或 reduce-scatter 来切换分片维度。
+直觉理解
+--------
+LayerNorm 和 Dropout 只需要对单个 token 操作，不需要跨 token 的信息。
+既然如此，为什么每张卡都要存完整的序列？把序列沿长度方向切成 P 段，
+每卡只存 S/P 个 token 的激活值，显存立省 (P-1)/P。
+
+数学原理
+--------
+设输入 X ∈ ℝ^(B×S×D)，world_size = P：
+
+1. 每卡持有 X_local = X[:, rank·(S/P):(rank+1)·(S/P), :]  ∈ ℝ^(B × S/P × D)
+2. 激活显存节省：(P-1)/P（每卡只存 1/P 的序列长度）
+3. SP ↔ 非 SP 区域转换：
+   - 离开 SP 区域（进入 TP 区域）：All-Gather 恢复完整序列  → 通信量 B×S×D
+   - 进入 SP 区域（离开 TP 区域）：Reduce-Scatter 切分序列  → 通信量 B×S×D
+
+与 TP 的关系：SP 不是独立的并行策略，而是 TP 的优化。在标准 TP 中，
+LayerNorm/Dropout 的激活值在所有 rank 上冗余存储；SP 通过沿序列维度切分
+消除这种冗余，代价是每次进出 SP 区域需要一次通信（All-Gather / Reduce-Scatter）。
+
+代码流程
+--------
+1. scatter_along_seq: 将完整序列沿 seq 维度切分到各 rank
+2. gather_along_seq: 从各 rank 收集序列块，拼回完整序列
+3. sp_transition_fwd: SP 与非 SP 区域之间的转换入口
 """
 import torch
 import torch.distributed as dist
@@ -9,7 +32,23 @@ from parallel.communication.setup import get_rank, get_world_size
 
 
 def scatter_along_seq(x: torch.Tensor) -> torch.Tensor:
-    """将 tensor 沿 sequence 维度切分，每个 rank 保留本地 chunk"""
+    """将张量沿序列维度切分，每个 rank 保留本地 chunk。
+
+    直觉
+    ----
+    把一条长队伍按人数均分成 P 段，每段分给一个组长管理。
+
+    数学
+    ----
+    X_local = X[:, rank·(S/P):(rank+1)·(S/P), :]    ∈ ℝ^(B × S/P × D)
+    其中 S/P = x.shape[1] // world_size
+
+    Args:
+        x: 完整输入张量，形状 (B, S, D)。
+
+    Returns:
+        本地序列块，形状 (B, S/P, D)。
+    """
     rank = get_rank()
     world_size = get_world_size()
     seq_len = x.shape[1]
@@ -18,7 +57,24 @@ def scatter_along_seq(x: torch.Tensor) -> torch.Tensor:
 
 
 def gather_along_seq(x: torch.Tensor, total_seq_len: int) -> torch.Tensor:
-    """从所有 rank 收集 sequence chunk，拼回完整序列"""
+    """从所有 rank 收集序列块，all-gather 拼回完整序列。
+
+    直觉
+    ----
+    各组长把自己管理的队伍段汇报上来，拼接成完整的长队伍。
+
+    数学
+    ----
+    X_full = AllGather([X₀, X₁, ..., Xₚ₋₁])    ∈ ℝ^(B × S × D)
+    通信量：B × S × D 个元素
+
+    Args:
+        x: 本地序列块，形状 (B, S/P, D)。
+        total_seq_len: 完整序列长度 S。
+
+    Returns:
+        完整序列张量，形状 (B, S, D)。
+    """
     world_size = get_world_size()
     full = [torch.zeros_like(x) for _ in range(world_size)]
     dist.all_gather(full, x)
@@ -26,10 +82,32 @@ def gather_along_seq(x: torch.Tensor, total_seq_len: int) -> torch.Tensor:
 
 
 def sp_transition_fwd(x: torch.Tensor, from_sp: bool = True) -> torch.Tensor:
-    """
-    SP 与非 SP 区域之间的转换。
-    from_sp=True: 离开 SP 区域，需要 all-gather 恢复完整序列
-    from_sp=False: 进入 SP 区域，需要 reduce-scatter 或简单切分
+    """SP 与非 SP 区域之间的转换。
+
+    直觉
+    ----
+    from_sp=True 像是把分散的拼图拼回全景图（All-Gather），
+    from_sp=False 像是把全景图剪成 P 份分给各人（Scatter）。
+
+    数学
+    ----
+    - from_sp=True（离开 SP 区域）：
+      X_full = AllGather(X_local)    ∈ ℝ^(B × S × D)
+      通信量：B × S × D
+    - from_sp=False（进入 SP 区域）：
+      X_local = X[:, rank·(S/P):(rank+1)·(S/P), :]    ∈ ℝ^(B × S/P × D)
+      无通信（本地切分）
+
+    注意：在完整 Megatron 实现中，from_sp=False 应使用 Reduce-Scatter
+    （通信量 B×S×D），而非简单的本地 Scatter。当前简化实现使用 Scatter。
+
+    Args:
+        x: 输入张量。from_sp=True 时形状 (B, S/P, D)；from_sp=False 时形状 (B, S, D)。
+        from_sp: True 表示从 SP 区域转出（All-Gather），False 表示转入 SP 区域（Scatter）。
+
+    Returns:
+        from_sp=True: 完整序列张量，形状 (B, S, D)。
+        from_sp=False: 本地序列块，形状 (B, S/P, D)。
     """
     if from_sp:
         return gather_along_seq(x, get_world_size() * x.shape[1])

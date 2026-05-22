@@ -1,4 +1,35 @@
-"""KV Cache 分片：在推理时将 KV Cache 按 head 维度分布到多卡，减少单卡显存。"""
+"""KV Cache 分片：在推理时将 KV Cache 按 head 维度分布到多卡，减少单卡显存。
+
+直觉
+----
+KV Cache 就像一个大文件，按 head 维度切分到不同硬盘上存储——
+每张卡只存自己负责的那部分 head 的 K 和 V，需要完整结果时再拼接。
+这样单卡显存只需原来的 1/P（P 为 GPU 数），支持更长序列或更大 batch。
+
+数学
+----
+1. 总 KV Cache 显存（float16）：
+        total = 4 × B × n_heads × S × d_head  bytes
+   其中系数 4 = 2（K+V 各一份）× 2（float16 每元素 2 字节）
+
+2. 分片后单卡显存：
+        per_gpu = total / P
+   节省比例 = 1 - 1/P
+
+3. 分片策略对比：
+   - 按 head 切（TP 风格）：每卡持有 n_heads/P 个 head 的完整 KV
+     优点：无需通信即可独立计算局部注意力
+     缺点：需要 All-Reduce 汇总各 head 的注意力输出
+   - 按 batch 切（DP 风格）：每卡持有 B/P 个样本的完整 KV
+     优点：完全独立，无需通信
+     缺点：无法扩大单样本的序列长度
+
+代码流程
+--------
+1. ``shard_kv_cache_by_heads`` —— 按 head 维度切分 KV Cache
+2. ``gather_kv_cache`` —— 收集所有分片恢复完整 KV Cache
+3. ``kv_cache_memory_analysis`` —— KV Cache 显存占用分析
+"""
 import torch
 
 

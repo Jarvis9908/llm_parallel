@@ -1,4 +1,48 @@
-"""Megatron-LM 风格 TP+SP Transformer 块。组合列并行、行并行和序列并行。"""
+"""Megatron-LM 风格 TP+SP Transformer 块 —— 列并行与行并行配对，结合序列并行优化激活显存。
+
+直觉理解
+--------
+Transformer 中的 Attention 和 FFN 天然可以拆成「列并行 → 行并行」的对子：
+QKV 投影是列并行（按列切权重），Output 投影是行并行（按行切权重）；
+Gate+Up 投影是列并行，Down 投影是行并行。每对只需一次 all-reduce 通信。
+序列并行 (SP) 则在 LayerNorm/Dropout 区域沿序列维度切分激活值，进一步节省显存。
+
+数学原理
+--------
+一个完整 Transformer 块的数据流（含 SP）：
+
+    ┌─────────────────────────────────────────────────────────────────┐
+    │  SP 区域: x_local ∈ ℝ^(B×(S/P)×D)                            │
+    │    ↓ All-Gather (沿 seq 维度)                                  │
+    │  x_full ∈ ℝ^(B×S×D)                                           │
+    │    ↓ Column Parallel (QKV 投影)                                │
+    │  qkv_local ∈ ℝ^(B×S×(3H/P))                                   │
+    │    ↓ Attention 计算                                             │
+    │  attn_out_local ∈ ℝ^(B×S×(H/P))                                │
+    │    ↓ Row Parallel + All-Reduce (Output 投影)                    │
+    │  o_full ∈ ℝ^(B×S×D)                                            │
+    │    ↓ Reduce-Scatter (沿 seq 维度)                               │
+    │  SP 区域: x_local ∈ ℝ^(B×(S/P)×D)                             │
+    │    ↓ All-Gather                                                 │
+    │  x_full ∈ ℝ^(B×S×D)                                            │
+    │    ↓ Column Parallel (Gate+Up 投影)                             │
+    │  gate_up_local ∈ ℝ^(B×S×(2H/P))                                │
+    │    ↓ FFN 计算                                                   │
+    │  ffn_out_local ∈ ℝ^(B×S×(H/P))                                 │
+    │    ↓ Row Parallel + All-Reduce (Down 投影)                      │
+    │  out_full ∈ ℝ^(B×S×D)                                          │
+    │    ↓ Reduce-Scatter                                             │
+    │  SP 区域: out_local ∈ ℝ^(B×(S/P)×D)                           │
+    └─────────────────────────────────────────────────────────────────┘
+
+通信次数：每个 Transformer 块 4 次通信（2 次 All-Gather + 2 次 Reduce-Scatter），
+其中 All-Gather 和 Reduce-Scatter 是 SP 区域与非 SP 区域之间的转换，
+列并行→行并行的 all-reduce 已包含在 Row Parallel 步骤中。
+
+代码流程
+--------
+1. megatron_transformer_block_fwd: 模拟完整 Transformer 块的 TP+SP 前向流程
+"""
 import torch
 import torch.distributed as dist
 from parallel.communication.setup import get_rank, get_world_size
@@ -18,13 +62,51 @@ def megatron_transformer_block_fwd(
     w_down: torch.Tensor,
     use_sp: bool = True,
 ) -> torch.Tensor:
-    """
-    模拟 Megatron 风格 Transformer 块的 TP+SP 前向。
+    """模拟 Megatron 风格 Transformer 块的 TP+SP 前向传播。
 
-    SP 区域：LayerNorm（在本地 sequence chunk 上计算）
-    非 SP 区域：Attention（all-gather 后完整序列）和 FFN（进入时切分出 SP 区域）
+    直觉
+    ----
+    一个 Transformer 块 = 两对「列并行→行并行」+ SP 区域切换。
+    Attention 是第一对（QKV 列并行 → Output 行并行），
+    FFN 是第二对（Gate+Up 列并行 → Down 行并行）。
+    SP 在 LayerNorm 处沿序列维度切分激活值，进出时做通信切换。
 
-    这展示了 TP+SP 如何交替切换分片维度以减少激活显存。
+    数学
+    ----
+    数据流与通信量（use_sp=True 时）：
+
+    1. SP→TP: All-Gather, 通信量 B×S×D
+       x_local (B, S/P, D) → x_full (B, S, D)
+    2. Column Parallel QKV: x_full @ w_qkv → qkv_local (B, S, 3H/P)
+    3. Attention 计算 → attn_out_local (B, S, H/P)
+    4. Row Parallel Output + All-Reduce: attn_out_local @ w_o → o_full (B, S, D)
+       通信量 B×S×D
+    5. TP→SP: Reduce-Scatter, 通信量 B×S×D
+       o_full (B, S, D) → x_local (B, S/P, D)
+    6. SP→TP: All-Gather, 通信量 B×S×D
+    7. Column Parallel Gate+Up: x_full @ w_gate_up → gate_up_local (B, S, 2H/P)
+    8. FFN 计算 → ffn_out_local (B, S, H/P)
+    9. Row Parallel Down + All-Reduce: ffn_out_local @ w_down → out_full (B, S, D)
+       通信量 B×S×D
+    10. TP→SP: Reduce-Scatter, 通信量 B×S×D
+
+    每个 Transformer 块总通信量：4 × B×S×D（2 次 All-Gather + 2 次 Reduce-Scatter，
+    行并行的 all-reduce 已内含在步骤 4、9 中）。
+
+    Args:
+        x: 输入张量，形状 (B, S, D)，SP 模式下为完整序列（函数内部做 scatter）。
+        w_qkv: QKV 投影权重（列并行切分后），形状 (D, 3H/P)。
+        w_o: Output 投影权重（行并行切分后），形状 (H/P, D)。
+        w_gate_up: Gate+Up 投影权重（列并行切分后），形状 (D, 2H/P)。
+        w_down: Down 投影权重（行并行切分后），形状 (H/P, D)。
+        use_sp: 是否启用序列并行。默认 True。
+
+    Returns:
+        输出张量，形状 (B, S, D)。
+
+    Note:
+        当前为简化演示实现，主要展示数据流和通信模式，
+        未包含完整的 Attention 和 FFN 计算逻辑。
     """
     B, S, D = x.shape
 

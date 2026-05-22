@@ -1,4 +1,38 @@
-"""推测解码 (Speculative Decoding)：用小模型快速生成候选 token 序列，再用大模型并行验证，加速自回归推理。"""
+"""推测解码 (Speculative Decoding)：用小模型快速生成候选 token 序列，再用大模型并行验证，加速自回归推理。
+
+直觉
+----
+小模型先猜，大模型验证——就像考试时先快速写出答案，再仔细检查。
+小模型（draft model）参数少、推理快，逐 token 生成一个候选序列；
+大模型（target model）参数多、精度高，一次前向传播就能并行验证
+所有候选 token。接受正确的，拒绝错误的，从修正分布中采样替代 token。
+
+数学
+----
+1. 验证过程：对于候选 token x_t，接受概率为
+        p_accept = min(1, p_target(x_t) / p_draft(x_t))
+   即大模型概率 / 小模型概率。若 p_target > p_draft，一定接受；
+   若 p_target < p_draft，以概率比接受。
+
+2. 修正分布采样：当拒绝 token x_t 时，从修正分布中采样替代 token：
+        p_reject(x) ∝ max(0, p_target(x) - p_draft(x))
+   这保证了最终输出严格服从大模型分布，即无损保证。
+
+3. 加速比分析：
+        speedup = n_accepted / (1 + t_draft / t_target)
+   其中 n_accepted 是平均每次验证接受的 token 数，
+   t_draft 是草稿模型生成时间，t_target 是目标模型验证时间。
+   当接受率高且草稿模型快时，加速比可达 2-3x。
+
+4. 无损保证：推测解码的输出分布与纯大模型自回归解码完全一致，
+   因为拒绝时的修正采样补偿了接受概率的差异。
+
+代码流程
+--------
+1. ``draft_generate`` —— 草稿模型生成候选 token 序列
+2. ``target_verify`` —— 目标模型并行验证候选 token
+3. ``speedup_analysis`` —— 加速比分析
+"""
 import torch
 
 
@@ -33,31 +67,102 @@ def target_verify(
     target_model,
     prompt: torch.LongTensor,
     candidates: torch.LongTensor,
+    draft_model=None,
+    temperature: float = 1.0,
 ) -> tuple[torch.LongTensor, int]:
     """
-    用大模型并行验证候选 token 序列。
+    用大模型并行验证候选 token 序列（完整实现）。
 
-    将 prompt 与候选序列拼接后一次前向传播，大模型可同时计算每个位置
-    的 logits。然后逐位置比对草稿模型的生成结果与大模型的预测结果：
-    如果匹配则接受，一旦不匹配则停止（按需回退）。
-    当前实现为简化版，直接接受所有候选。
+    直觉：大模型一次性看完所有候选 token，逐个检查"我会不会也生成这个 token"。
+    猜对的保留，猜错的从大模型的分布重新采样。
+
+    数学（接受-拒绝采样）：
+        对每个候选位置 t：
+            1. 计算接受概率：p_accept = min(1, p_target(x_t) / p_draft(x_t))
+            2. 以概率 p_accept 决定是否接受
+            3. 如果接受：继续验证下一个位置
+            4. 如果拒绝：
+               a. 从修正分布采样：p_corrected(x) ∝ max(0, p_target(x) - p_draft(x))
+               b. 返回已接受的 token + 修正采样的 token
+
+        无损保证：最终输出分布与目标模型自回归分布完全相同。
 
     Args:
         target_model: 大参数量的目标模型
         prompt: 输入 prompt token 序列，形状 (batch, seq_len)
         candidates: 草稿模型生成的候选 token，形状 (batch, n_candidates)
+        draft_model: 草稿模型（用于计算接受概率），如果为 None 则接受所有候选
+        temperature: 采样温度
 
     Returns:
         (accepted_tokens, n_accepted):
-            accepted_tokens: 被接受的 token 序列
-            n_accepted: 被接受的 token 数量
+            accepted_tokens: 被接受的 token 序列 + 修正采样 token，形状 (batch, variable)
+            n_accepted: 被接受的候选 token 数量（不含修正采样 token）
     """
     target_model.eval()
+    batch_size = prompt.shape[0]
+    n_candidates = candidates.shape[1]
+
+    # 拼接 prompt 和候选序列，一次前向传播
     full_input = torch.cat([prompt, candidates], dim=1)
     with torch.no_grad():
         logits = target_model(full_input)
-    # 简化实现：接受所有候选 token（实际场景需逐位置比对验证）
-    return candidates, candidates.shape[1]
+
+    # 如果没有草稿模型，简化为接受所有候选
+    if draft_model is None:
+        return candidates, n_candidates
+
+    # 计算草稿模型的概率
+    draft_input = torch.cat([prompt, candidates[:, :-1]], dim=1)
+    with torch.no_grad():
+        draft_logits = draft_model(draft_input)
+
+    # 逐位置验证
+    accepted_list = []
+    n_accepted = 0
+
+    for t in range(n_candidates):
+        # 目标模型在位置 prompt_len + t - 1 的预测（预测第 t 个候选）
+        target_probs = torch.softmax(logits[:, prompt.shape[1] + t - 1] / temperature, dim=-1)
+        draft_probs = torch.softmax(draft_logits[:, prompt.shape[1] + t - 1] / temperature, dim=-1)
+
+        # 候选 token
+        candidate_token = candidates[:, t]  # (batch,)
+
+        # 接受概率
+        p_target = target_probs.gather(1, candidate_token.unsqueeze(1)).squeeze(1)
+        p_draft = draft_probs.gather(1, candidate_token.unsqueeze(1)).squeeze(1)
+        p_accept = torch.min(torch.ones_like(p_target), p_target / (p_draft + 1e-10))
+
+        # 采样决定是否接受
+        accept = torch.rand_like(p_accept) < p_accept
+
+        if accept.all():
+            accepted_list.append(candidate_token)
+            n_accepted += 1
+        else:
+            # 至少一个 batch 元素拒绝，记录已接受的 token 并从修正分布采样
+            accepted_list.append(candidate_token * accept.long())
+
+            # 修正分布采样：p_corrected ∝ max(0, p_target - p_draft)
+            corrected_probs = torch.clamp(target_probs - draft_probs, min=0)
+            corrected_probs = corrected_probs / (corrected_probs.sum(dim=-1, keepdim=True) + 1e-10)
+            corrected_token = torch.multinomial(corrected_probs, 1).squeeze(1)
+            # 在拒绝的位置使用修正采样的 token
+            for b in range(batch_size):
+                if not accept[b]:
+                    accepted_list[-1][b] = corrected_token[b]
+            n_accepted += accept.sum().item()
+            break
+
+    # 如果所有候选都被接受，额外从目标模型采样一个 token
+    if len(accepted_list) == n_candidates:
+        target_probs_last = torch.softmax(logits[:, -1] / temperature, dim=-1)
+        extra_token = torch.multinomial(target_probs_last, 1).squeeze(1)
+        accepted_list.append(extra_token)
+
+    accepted_tokens = torch.stack(accepted_list, dim=1)
+    return accepted_tokens, n_accepted
 
 
 def speedup_analysis(
